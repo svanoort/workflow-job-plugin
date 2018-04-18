@@ -735,7 +735,7 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
     @Override public void setResult(Result r) {
         if (result == null || r.isWorseThan(result)) {
             result = r;
-            LOGGER.log(Level.FINE, this + " in " + getRootDir() + ": result is set to " + r, LOGGER.isLoggable(Level.FINER) ? new Exception() : null);
+            LOGGER.log(Level.FINE, this + " in " + getRootDir() + ": result is set to " + r, LOGGER.isLoggable(Level.FINER) ? new Exception("Throwing safe-to-ignore exception to show stack trace for set result call") : null);
         }
     }
 
