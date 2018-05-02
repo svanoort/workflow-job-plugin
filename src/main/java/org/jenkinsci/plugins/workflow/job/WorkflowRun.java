@@ -714,10 +714,13 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
     }
 
     @Override protected void onLoad() {
+        if (LOGGER.isLoggable(Level.FINER)) {
+            LOGGER.log(Level.FINER, "onLoad invoked for"+this, new Exception("Providing diagnostic stack trace"));
+        }
         try {
             synchronized (getLogCopyGuard()) {  // CHECKME: Deadlock risks here - copyLogGuard and locks on Run
                 if (executionLoaded) {
-                    LOGGER.log(Level.WARNING, "Double onLoad of build "+this);
+                    LOGGER.log(Level.WARNING, "Double onLoad of build "+this, new Exception("Warning:"));
                     return;
                 }
                 boolean needsToPersist = completed == null;
