@@ -89,6 +89,9 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.annotation.CheckForNull;
@@ -195,7 +198,7 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
      */
     Boolean completed;  // Non-private for testing
 
-    private transient Object logCopyGuard = new Object();
+    private transient ReadWriteLock lock = new ReentrantReadWriteLock();
 
     /** map from node IDs to log positions from which we should copy text */
     Map<String,Long> logsToCopy;  // Exposed for testing
@@ -208,11 +211,11 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
     /** True when first started, false when running after a restart. */
     private transient boolean firstTime;
 
-    private synchronized Object getLogCopyGuard() {
-        if (logCopyGuard == null) {
-            logCopyGuard = new Object();
-        }
-        return logCopyGuard;
+    /** Protects the logic using in the {@link #copyLogs()} methods.
+     * IMPORTANT NOTE: if combined with other locks, we should lock first on the run, then the copyLogGuard, then the Execution */
+    private ReadWriteLock getLock() {
+        // Lock field needs to be initiailized at onLoad
+        return lock;
     }
 
     /** Avoids creating new instances, analogous to {@link TaskListener#NULL} but as full StreamBuildListener. */
@@ -220,8 +223,8 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
 
     /** Used internally to ensure listener has been initialized correctly. */
     StreamBuildListener getListener() {
-        // Un-synchronized to prevent deadlocks (combination of run and logCopyGuard) until the log-handling rewrite removes the log copying
-        // Note that in portions where multithreaded access is possible we are already synchronizing on logCopyGuard
+        // Un-synchronized to prevent deadlocks (combination of run and lock) until the log-handling rewrite removes the log copying
+        // Note that in portions where multithreaded access is possible we are already synchronizing on lock
         if (listener == null) {
             try {
                 OutputStream logger = new FileOutputStream(getLogFile(), true);
@@ -310,7 +313,7 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
                 myListener.getLogger().println("Running in Durability level: "+DurabilityHintProvider.suggestedFor(this.project));
             }
             save();  // Save before we add to the FlowExecutionList, to ensure we never have a run with a null build.
-            synchronized (getLogCopyGuard()) {  // Technically safe but it makes FindBugs happy
+            synchronized (getLock()) {  // Technically safe but it makes FindBugs happy
                 FlowExecutionList.get().register(owner);
                 newExecution.addListener(new GraphL());
                 completed = Boolean.FALSE;
@@ -388,7 +391,7 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
         final AtomicReference<ScheduledFuture<?>> copyLogsTask = new AtomicReference<>();
         copyLogsTask.set(copyLogsExecutorService().scheduleAtFixedRate(new Runnable() {
             @Override public void run() {
-                synchronized (getLogCopyGuard()) {
+                synchronized (this){ synchronized (getLock()) {
                     if (completed == null) {
                         // Loading run, give it a moment.
                         return;
@@ -399,17 +402,27 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
                         return;
                     }
                     Jenkins jenkins = Jenkins.getInstance();
+
+                    // WRITELOCK
                     if (jenkins == null || jenkins.isTerminating()) {
-                        LOGGER.log(Level.FINE, "shutting down, breaking waitForCompletion on {0}", this);
-                        // Stop writing content, in case a new set of objects gets loaded after in-VM restart and starts writing to the same file:
-                        getListener().closeQuietly();
-                        listener = NULL_LISTENER;
+                        Lock writer = getLock().writeLock();
+                        try {
+                            writer.lock();
+                            LOGGER.log(Level.FINE, "shutting down, breaking waitForCompletion on {0}", this);
+                            // Stop writing content, in case a new set of objects gets loaded after in-VM restart and starts writing to the same file:
+                            getListener().closeQuietly();
+                            listener = NULL_LISTENER;
+                        } finally {
+                            writer.unlock();
+                        }
                         return;
                     }
+
+
                     try (WithThreadName naming = new WithThreadName(" (" + WorkflowRun.this + ")")) {
                         copyLogs();
                     }
-                }
+                }}
             }
         }, 1, 1, TimeUnit.SECONDS));
         return asynchronousExecution;
@@ -444,7 +457,9 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
         final Throwable x = new FlowInterruptedException(Result.ABORTED);
         FlowExecution exec = getExecution();
         if (exec == null) { // Already dead, just make sure statuses reflect that.
-            synchronized (getLogCopyGuard()) {
+            Lock l = getLock().writeLock();
+            try {
+                l.lock();
                 // Null execution means a hard-kill of the execution and build is by definition dead
                 // So we should make sure the result is set to failure if un-set and it's completed and then save.
                 boolean modified = false;
@@ -460,6 +475,8 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
                     saveWithoutFailing();
                 }
                 return;
+            } finally {
+                l.unlock();
             }
         }
         Futures.addCallback(exec.getCurrentExecutions(/* cf. JENKINS-26148 */true), new FutureCallback<List<StepExecution>>() {
@@ -489,8 +506,12 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
         if (!isBuilding() || /* probably redundant, but just to be sure */ execution == null) {
             return;
         }
-        synchronized (getLogCopyGuard()) {
+        Lock l = getLock().writeLock();
+        try {
+            l.lock();
             getListener().getLogger().println("Hard kill!");
+        } finally {
+            l.unlock();
         }
         synchronized (this) {
             execution = null; // ensures isInProgress returns false
@@ -532,7 +553,7 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
         return isBuilding() && allowKill;
     }
 
-    @GuardedBy("logCopyGuard")
+    @GuardedBy("lock")
     private void copyLogs() {
         if (logsToCopy == null) { // finished
             return;
@@ -622,11 +643,11 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
         }
     }
 
-    @GuardedBy("logCopyGuard")
+    @GuardedBy("lock")
     private transient Cache<FlowNode,Optional<String>> branchNameCache;  // TODO Consider making this a top-level FlowNode API
 
     private Cache<FlowNode, Optional<String>> getBranchNameCache() {
-        synchronized (getLogCopyGuard()) {
+        synchronized (getLock()) {
             if (branchNameCache == null) {
                 branchNameCache = CacheBuilder.newBuilder().weakKeys().build();
             }
@@ -711,11 +732,22 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
 
         // super.reload() forces result to be FAILURE, so working around that
         new XmlFile(XSTREAM,new File(getRootDir(),"build.xml")).unmarshal(this);
+        if (lock != null) {
+            lock = new ReentrantReadWriteLock();
+        } else {
+            // Who knows?!
+        }
+
     }
 
     @Override protected void onLoad() {
+        if (executionLoaded) {
+            LOGGER.log(Level.WARNING, "Double onLoad of build "+this);
+            return;
+        }
+        lock = new ReentrantReadWriteLock();
         try {
-            synchronized (getLogCopyGuard()) {  // CHECKME: Deadlock risks here - copyLogGuard and locks on Run
+            synchronized (getLock()) {  // Need to lock Run first to avoid deadlock risk
                 if (executionLoaded) {
                     LOGGER.log(Level.WARNING, "Double onLoad of build "+this);
                     return;
@@ -780,7 +812,7 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
     /** Handles normal build completion (including errors) but also handles the case that the flow did not even start correctly, for example due to an error in {@link FlowExecution#start}. */
     private void finish(@Nonnull Result r, @CheckForNull Throwable t) {
         boolean nullListener = false;
-        synchronized (getLogCopyGuard()) {
+        synchronized (getLock()) {
             nullListener = listener == null;
             setResult(r);
             completed = Boolean.TRUE;
@@ -840,47 +872,66 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
      * Performs all the needed initialization for the execution pre-loading too -- sets the executionPromise, adds Listener, calls onLoad on it etc.
      * @return non-null after the flow has started, even after finished (but may be null temporarily when about to start, or if starting failed)
      */
-    public synchronized @CheckForNull FlowExecution getExecution() {
-        if (executionLoaded || execution == null) {
-            return execution;
-        } else {  // Try to lazy-load execution
-            FlowExecution fetchedExecution = execution;
-            try {
-                if (fetchedExecution instanceof BlockableResume) {
-                    BlockableResume blockableExecution = (BlockableResume)execution;
-                    boolean parentBlocked = getParent().isResumeBlocked();
-                    if (parentBlocked != blockableExecution.isResumeBlocked()) {  // Avoids issues with WF-CPS versions before JENKINS-49961 patch
-                        blockableExecution.setResumeBlocked(parentBlocked);
-                    }
-                }
-                GraphListener finishListener = null;
-                if (this.completed != Boolean.TRUE) {
-                    finishListener = new FailOnLoadListener();
-                    fetchedExecution.addListener(finishListener);  // So we can still ensure build finishes if onLoad generates a FlowEndNode
-                }
-                fetchedExecution.onLoad(new Owner(this));
-                if (this.completed != Boolean.TRUE) {
-                    // Defer the normal listener to ensure onLoad can complete before finish() is called since that may
-                    // need the build to be loaded and can result in loading loops otherwise.
-                    fetchedExecution.removeListener(finishListener);
-                    fetchedExecution.addListener(new GraphL());
-                }
-                SettableFuture<FlowExecution> settablePromise = getSettableExecutionPromise();
-                if (!settablePromise.isDone()) {
-                    settablePromise.set(fetchedExecution);
-                }
-                executionLoaded = true;
-                return fetchedExecution;
-            } catch (Exception x) {
-                if (result == null) {
-                    setResult(Result.FAILURE);
-                }
-                LOGGER.log(Level.WARNING, "Nulling out FlowExecution due to error in build "+this, x);
-                execution = null; // probably too broken to use
-                executionLoaded = true;
-                saveWithoutFailing(); // Ensure we do not try to load again
-                return null;
+    public @CheckForNull FlowExecution getExecution() {
+        Lock reader = getLock().readLock();
+
+
+        try {
+            // First try to obtain the execution with a readLock - no contention
+            reader.lock();
+            if (executionLoaded || execution == null) {
+                return execution;
             }
+        } finally {
+            reader.unlock();
+        }
+
+        Lock writer = getLock().writeLock();
+        try {
+            writer.lock();
+            if (executionLoaded || execution == null) {
+                return execution;
+            } else {  // Try to lazy-load execution
+                FlowExecution fetchedExecution = execution;
+                try {
+                    if (fetchedExecution instanceof BlockableResume) {
+                        BlockableResume blockableExecution = (BlockableResume) execution;
+                        boolean parentBlocked = getParent().isResumeBlocked();
+                        if (parentBlocked != blockableExecution.isResumeBlocked()) {  // Avoids issues with WF-CPS versions before JENKINS-49961 patch
+                            blockableExecution.setResumeBlocked(parentBlocked);
+                        }
+                    }
+                    GraphListener finishListener = null;
+                    if (this.completed != Boolean.TRUE) {
+                        finishListener = new FailOnLoadListener();
+                        fetchedExecution.addListener(finishListener);  // So we can still ensure build finishes if onLoad generates a FlowEndNode
+                    }
+                    fetchedExecution.onLoad(new Owner(this));
+                    if (this.completed != Boolean.TRUE) {
+                        // Defer the normal listener to ensure onLoad can complete before finish() is called since that may
+                        // need the build to be loaded and can result in loading loops otherwise.
+                        fetchedExecution.removeListener(finishListener);
+                        fetchedExecution.addListener(new GraphL());
+                    }
+                    SettableFuture<FlowExecution> settablePromise = getSettableExecutionPromise();
+                    if (!settablePromise.isDone()) {
+                        settablePromise.set(fetchedExecution);
+                    }
+                    executionLoaded = true;
+                    return fetchedExecution;
+                } catch (Exception x) {
+                    if (result == null) {
+                        setResult(Result.FAILURE);
+                    }
+                    LOGGER.log(Level.WARNING, "Nulling out FlowExecution due to error in build " + this, x);
+                    execution = null; // probably too broken to use
+                    executionLoaded = true;
+                    saveWithoutFailing(); // Ensure we do not try to load again
+                    return null;
+                }
+            }
+        } finally {
+            writer.unlock();
         }
     }
 
@@ -1155,7 +1206,7 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
         @Override public void onNewHead(FlowNode node) {
             if (node instanceof FlowEndNode) {
                 Timer.get().schedule(() -> {
-                    synchronized (getLogCopyGuard()) {
+                    synchronized (getLock()) {
                         finish(((FlowEndNode) node).getResult(), execution != null ? execution.getCauseOfFailure() : null);
                     }
                 }, 1, TimeUnit.SECONDS);
@@ -1165,14 +1216,16 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
 
     private final class GraphL implements GraphListener {
         @Override public void onNewHead(FlowNode node) {
-            synchronized (getLogCopyGuard()) {
-                copyLogs();
-                if (logsToCopy == null) {
-                    // Only happens when a FINISHED build loses FlowNodeStorage and we have to create placeholder nodes
-                    //  after the build is nominally completed.
-                    logsToCopy = new HashMap<String, Long>(3);
+            synchronized (this) { // Avoids deadlocks, by ensuring we can't
+                synchronized (getLock()) {
+                    copyLogs();
+                    if (logsToCopy == null) {
+                        // Only happens when a FINISHED build loses FlowNodeStorage and we have to create placeholder nodes
+                        //  after the build is nominally completed.
+                        logsToCopy = new HashMap<String, Long>(3);
+                    }
+                    logsToCopy.put(node.getId(), 0L);
                 }
-                logsToCopy.put(node.getId(), 0L);
             }
 
             if (node.getPersistentAction(TimingAction.class) == null) {
@@ -1240,8 +1293,7 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
     }
 
     @Override
-    public synchronized void save() throws IOException {
-
+    public void save() throws IOException {
         if(BulkChange.contains(this))   return;
         File loc = new File(getRootDir(),"build.xml");
         XmlFile file = new XmlFile(XSTREAM,loc);
@@ -1253,7 +1305,21 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
             isAtomic = hint.isAtomicWrite();
         }
 
-        PipelineIOUtils.writeByXStream(this, loc, XSTREAM2, isAtomic);
-        SaveableListener.fireOnChange(this, file);
+        Lock readLock = getLock().readLock();
+        try {
+            readLock.lock();
+            synchronized (this) { // Need to hold a lock Because Reasons, i.e. unpredictable synchronizations
+                Lock myLock = getLock().readLock();
+                try {
+                    myLock.lock();
+                    PipelineIOUtils.writeByXStream(this, loc, XSTREAM2, isAtomic);
+                    SaveableListener.fireOnChange(this, file);
+                } finally {
+                    myLock.unlock();
+                }
+            }
+        } finally {
+            readLock.unlock();
+        }
     }
 }
