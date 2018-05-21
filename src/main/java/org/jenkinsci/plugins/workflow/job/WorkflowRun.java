@@ -214,7 +214,6 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
     /** Protects the logic using in the {@link #copyLogs()} methods.
      * IMPORTANT NOTE: if combined with other locks, we should lock first on the run, then the copyLogGuard, then the Execution */
     private ReadWriteLock getLock() {
-        // Lock field needs to be initiailized at onLoad
         return lock;
     }
 
@@ -313,13 +312,17 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
                 myListener.getLogger().println("Running in Durability level: "+DurabilityHintProvider.suggestedFor(this.project));
             }
             save();  // Save before we add to the FlowExecutionList, to ensure we never have a run with a null build.
-            synchronized (getLock()) {  // Technically safe but it makes FindBugs happy
+            Lock writer = lock.writeLock();
+            try  {
+                writer.lock();
                 FlowExecutionList.get().register(owner);
                 newExecution.addListener(new GraphL());
                 completed = Boolean.FALSE;
                 logsToCopy = new ConcurrentSkipListMap<>();
                 executionLoaded = true;
                 execution = newExecution;
+            } finally {
+                writer.unlock();
             }
             SettableFuture<FlowExecution> exec = getSettableExecutionPromise();
             if (!exec.isDone()) {
@@ -391,7 +394,10 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
         final AtomicReference<ScheduledFuture<?>> copyLogsTask = new AtomicReference<>();
         copyLogsTask.set(copyLogsExecutorService().scheduleAtFixedRate(new Runnable() {
             @Override public void run() {
-                synchronized (this){ synchronized (getLock()) {
+
+                Lock reader = lock.readLock();
+                try {
+                    reader.lock();
                     if (completed == null) {
                         // Loading run, give it a moment.
                         return;
@@ -401,28 +407,30 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
                         copyLogsTask.get().cancel(false);
                         return;
                     }
-                    Jenkins jenkins = Jenkins.getInstance();
+                } finally {
+                    reader.unlock();
+                }
+                Jenkins jenkins = Jenkins.getInstance();
 
-                    // WRITELOCK
-                    if (jenkins == null || jenkins.isTerminating()) {
-                        Lock writer = getLock().writeLock();
-                        try {
-                            writer.lock();
-                            LOGGER.log(Level.FINE, "shutting down, breaking waitForCompletion on {0}", this);
-                            // Stop writing content, in case a new set of objects gets loaded after in-VM restart and starts writing to the same file:
-                            getListener().closeQuietly();
-                            listener = NULL_LISTENER;
-                        } finally {
-                            writer.unlock();
-                        }
-                        return;
+                // WriteLock while terminating
+                if (jenkins == null || jenkins.isTerminating()) {
+                    Lock writer = getLock().writeLock();
+                    try {
+                        writer.lock();
+                        LOGGER.log(Level.FINE, "shutting down, breaking waitForCompletion on {0}", this);
+                        // Stop writing content, in case a new set of objects gets loaded after in-VM restart and starts writing to the same file:
+                        getListener().closeQuietly();
+                        listener = NULL_LISTENER;
+                    } finally {
+                        writer.unlock();
                     }
+                    return;
+                }
 
 
-                    try (WithThreadName naming = new WithThreadName(" (" + WorkflowRun.this + ")")) {
-                        copyLogs();
-                    }
-                }}
+                try (WithThreadName naming = new WithThreadName(" (" + WorkflowRun.this + ")")) {
+                    copyLogs();
+                }
             }
         }, 1, 1, TimeUnit.SECONDS));
         return asynchronousExecution;
@@ -644,15 +652,21 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
     }
 
     @GuardedBy("lock")
-    private transient Cache<FlowNode,Optional<String>> branchNameCache;  // TODO Consider making this a top-level FlowNode API
+    private transient volatile Cache<FlowNode,Optional<String>> branchNameCache;
 
     private Cache<FlowNode, Optional<String>> getBranchNameCache() {
-        synchronized (getLock()) {
-            if (branchNameCache == null) {
-                branchNameCache = CacheBuilder.newBuilder().weakKeys().build();
+        if (branchNameCache == null) {
+            Lock writer = lock.writeLock();
+            try { // Using a volatile branchNameCache makes this double-checked locking safe
+                writer.lock();
+                if (branchNameCache == null) {
+                    branchNameCache = CacheBuilder.newBuilder().weakKeys().build();
+                }
+            } finally {
+                writer.unlock();
             }
-            return branchNameCache;
         }
+        return branchNameCache;
     }
 
     private @CheckForNull String getBranchName(FlowNode node) {
@@ -734,10 +748,7 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
         new XmlFile(XSTREAM,new File(getRootDir(),"build.xml")).unmarshal(this);
         if (lock != null) {
             lock = new ReentrantReadWriteLock();
-        } else {
-            // Who knows?!
         }
-
     }
 
     @Override protected void onLoad() {
@@ -746,54 +757,51 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
             return;
         }
         lock = new ReentrantReadWriteLock();
+        Lock writeLock = lock.writeLock();
         try {
-            synchronized (getLock()) {  // Need to lock Run first to avoid deadlock risk
-                if (executionLoaded) {
-                    LOGGER.log(Level.WARNING, "Double onLoad of build "+this);
-                    return;
-                }
-                boolean needsToPersist = completed == null;
-                super.onLoad();
+            writeLock.lock();
+            boolean needsToPersist = completed == null;
+            super.onLoad();
 
-                if (completed == Boolean.TRUE && result == null) {
-                    LOGGER.log(Level.FINE, "Completed build with no result set, defaulting to failure for "+this);
-                    setResult(Result.FAILURE);
-                    needsToPersist = true;
-                }
+            if (completed == Boolean.TRUE && result == null) {
+                LOGGER.log(Level.FINE, "Completed build with no result set, defaulting to failure for "+this);
+                setResult(Result.FAILURE);
+                needsToPersist = true;
+            }
 
-                // TODO See if we can simplify this, especially around interactions with 'completed'.
+            // TODO See if we can simplify this, especially around interactions with 'completed'.
 
-                if (execution != null && completed != Boolean.TRUE) {
-                    FlowExecution fetchedExecution = getExecution();  // Triggers execution.onLoad so we can resume running if not done
+            if (execution != null && completed != Boolean.TRUE) {
+                FlowExecution fetchedExecution = getExecution();  // Triggers execution.onLoad so we can resume running if not done
 
-                    if (fetchedExecution != null) {
-                        if (completed == null) {
-                            completed = Boolean.valueOf(fetchedExecution.isComplete());
-                        }
-
-                        if (!completed == Boolean.TRUE) {
-                            // we've been restarted while we were running. let's get the execution going again.
-                            FlowExecutionListener.fireResumed(fetchedExecution);
-
-                            getListener().getLogger().println("Resuming build at " + new Date() + " after Jenkins restart");
-                            Timer.get().submit(() -> Queue.getInstance().schedule(new AfterRestartTask(WorkflowRun.this), 0)); // JENKINS-31614
-                        }
-                    } else {   // Execution nulled due to a critical failure, explicitly mark completed
-                        completed = Boolean.TRUE;
+                if (fetchedExecution != null) {
+                    if (completed == null) {
+                        completed = Boolean.valueOf(fetchedExecution.isComplete());
                     }
-                } else if (execution == null) {
+
+                    if (!completed == Boolean.TRUE) {
+                        // we've been restarted while we were running. let's get the execution going again.
+                        FlowExecutionListener.fireResumed(fetchedExecution);
+
+                        getListener().getLogger().println("Resuming build at " + new Date() + " after Jenkins restart");
+                        Timer.get().submit(() -> Queue.getInstance().schedule(new AfterRestartTask(WorkflowRun.this), 0)); // JENKINS-31614
+                    }
+                } else {   // Execution nulled due to a critical failure, explicitly mark completed
                     completed = Boolean.TRUE;
                 }
-                if (needsToPersist && completed) {
-                    try {
-                        save();
-                    } catch (Exception ex) {
-                        LOGGER.log(Level.WARNING, "Error while saving build to update completed flag "+this, ex);
-                    }
+            } else if (execution == null) {
+                completed = Boolean.TRUE;
+            }
+            if (needsToPersist && completed) {
+                try {
+                    save();
+                } catch (Exception ex) {
+                    LOGGER.log(Level.WARNING, "Error while saving build to update completed flag "+this, ex);
                 }
             }
-        } finally {  // Ensure the run is ALWAYS removed from loading even if something failed, so threads awaken.
             checkouts(null); // only for diagnostics
+        } finally {  // Ensure the run is ALWAYS removed from loading even if something failed, so threads awaken.
+            writeLock.unlock();
             synchronized (LOADING_RUNS) {
                 LOADING_RUNS.remove(key()); // or could just make the value type be WeakReference<WorkflowRun>
                 LOADING_RUNS.notifyAll();
@@ -812,14 +820,19 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
     /** Handles normal build completion (including errors) but also handles the case that the flow did not even start correctly, for example due to an error in {@link FlowExecution#start}. */
     private void finish(@Nonnull Result r, @CheckForNull Throwable t) {
         boolean nullListener = false;
-        synchronized (getLock()) {
+        Lock writeLock = getLock().writeLock();
+        try {
+            writeLock.lock();
             nullListener = listener == null;
             setResult(r);
             completed = Boolean.TRUE;
             duration = Math.max(0, System.currentTimeMillis() - getStartTimeInMillis());
+            logsToCopy = null;
+            branchNameCache = null;
+        } finally {
+            writeLock.unlock();
         }
-        logsToCopy = null;
-        branchNameCache = null;
+
         try {
             LOGGER.log(Level.INFO, "{0} completed: {1}", new Object[]{toString(), getResult()});
             if (nullListener) {
@@ -837,7 +850,6 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
                 getListener().finished(getResult());
                 getListener().closeQuietly();
             }
-            logsToCopy = null;
             saveWithoutFailing();
             Timer.get().submit(() -> {
                 try {
@@ -874,7 +886,6 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
      */
     public @CheckForNull FlowExecution getExecution() {
         Lock reader = getLock().readLock();
-
 
         try {
             // First try to obtain the execution with a readLock - no contention
@@ -948,6 +959,7 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
     @Nonnull
     private SettableFuture<FlowExecution> getSettableExecutionPromise() {
         synchronized(this) {
+            // FIXME should rely on initialization at load time or a volatile field with double-checked locking
             if (executionPromise == null) {
                 executionPromise = SettableFuture.create();
             }
@@ -1206,9 +1218,8 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
         @Override public void onNewHead(FlowNode node) {
             if (node instanceof FlowEndNode) {
                 Timer.get().schedule(() -> {
-                    synchronized (getLock()) {
-                        finish(((FlowEndNode) node).getResult(), execution != null ? execution.getCauseOfFailure() : null);
-                    }
+                    // No synchronization because finish operation deals with that
+                    finish(((FlowEndNode) node).getResult(), execution != null ? execution.getCauseOfFailure() : null);
                 }, 1, TimeUnit.SECONDS);
             }
         }
@@ -1216,8 +1227,11 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
 
     private final class GraphL implements GraphListener {
         @Override public void onNewHead(FlowNode node) {
-            synchronized (this) { // Avoids deadlocks, by ensuring we can't
-                synchronized (getLock()) {
+            // FIXME verify we still need to lock on the run and that lock order is proper
+            synchronized (this) { // Avoids deadlocks, by ensuring we hold a lock on the Run first
+                Lock writer = lock.writeLock();
+                try {
+                    writer.lock();
                     copyLogs();
                     if (logsToCopy == null) {
                         // Only happens when a FINISHED build loses FlowNodeStorage and we have to create placeholder nodes
@@ -1225,6 +1239,8 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
                         logsToCopy = new HashMap<String, Long>(3);
                     }
                     logsToCopy.put(node.getId(), 0L);
+                } finally {
+                    writer.unlock();
                 }
             }
 
@@ -1306,20 +1322,16 @@ public final class WorkflowRun extends Run<WorkflowJob,WorkflowRun> implements F
         }
 
         Lock readLock = getLock().readLock();
-        try {
+
+        synchronized (this) { // Need to hold a lock in case things are synchronizing on Run, and need to sync on that first
             readLock.lock();
-            synchronized (this) { // Need to hold a lock Because Reasons, i.e. unpredictable synchronizations
-                Lock myLock = getLock().readLock();
-                try {
-                    myLock.lock();
-                    PipelineIOUtils.writeByXStream(this, loc, XSTREAM2, isAtomic);
-                    SaveableListener.fireOnChange(this, file);
-                } finally {
-                    myLock.unlock();
-                }
+            try {
+                PipelineIOUtils.writeByXStream(this, loc, XSTREAM2, isAtomic);
+                SaveableListener.fireOnChange(this, file);
+            } finally {
+                readLock.unlock();
             }
-        } finally {
-            readLock.unlock();
         }
+
     }
 }
